@@ -1,5 +1,6 @@
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,21 +13,51 @@
 #define BACKLOG 5
 #define MAX_CLIENTS 10
 
-int client_sockets[MAX_CLIENTS];
+// Client info
+typedef struct {
+    int sockfd;
+    char name[1000];
+} client;
+
+client clients[MAX_CLIENTS];
 pthread_mutex_t client_lock;
 
-// Broadcast a client's message to all other clients
-void broadcast_client_message(const char *msg, int sender_fd) {
+// Send a message to a specific client
+void send_message_to_client(const char *msg, client *sender, int receiver_fd) {
     pthread_mutex_lock(&client_lock);  // Lock to avoid race conditions
 
     // Prepare the message with the client ID
     char client_message[1100];
-    snprintf(client_message, sizeof(client_message), "Client %d: %s", sender_fd, msg);
+    snprintf(client_message, sizeof(client_message), "%s: %s", sender->name, msg);
+
+    // Send the prepared message to the receiver client
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        client *c = &clients[i];
+        if (c->sockfd != 0 && c->sockfd == receiver_fd) {
+            int bytes_written = write(c->sockfd, client_message, strlen(client_message));
+            if (bytes_written < 0) {
+                perror("Error sending message to client");
+            }
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&client_lock);
+}
+
+// Broadcast a client's message to all other clients
+void broadcast_client_message(const char *msg, client *sender) {
+    pthread_mutex_lock(&client_lock);  // Lock to avoid race conditions
+
+    // Prepare the message with the client ID
+    char client_message[1100];
+    snprintf(client_message, sizeof(client_message), "%s: %s", sender->name, msg);
 
 	// Send the prepared message to every client, other than the sender
     for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (client_sockets[i] != 0 && client_sockets[i] != sender_fd) {
-            int bytes_written = write(client_sockets[i], client_message, strlen(client_message));
+        client *c = &clients[i];
+        if (c->sockfd != 0 && c->sockfd != sender->sockfd) {
+            int bytes_written = write(c->sockfd, client_message, strlen(client_message));
             if (bytes_written < 0) {
                 perror("Error sending message to client");
             }
@@ -47,8 +78,9 @@ void broadcast_server_message(const char *msg) {
 
 	// Send the prepared message to every client
     for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (client_sockets[i] != 0) {
-            int bytes_written = write(client_sockets[i], server_message, strlen(server_message));
+        client *c = &clients[i];
+        if (c->sockfd != 0) {
+            int bytes_written = write(c->sockfd, server_message, strlen(server_message));
             if (bytes_written < 0) {
                 perror("Error sending message to client");
             }
@@ -60,11 +92,28 @@ void broadcast_server_message(const char *msg) {
 
 // Handle each client connection
 void *handle_client_input(void *arg) {
-    int clientfd = *(int *)arg;
+    client *c = (client *)arg;
     char buf[1000];
+    char client_name[1000];
+
+    // Assign a name to the client
+    write(c->sockfd, "Enter your name: ", 17);
+    int bytes_read = read(c->sockfd, buf, sizeof(buf) - 1);
+    buf[bytes_read] = '\0';
+    strcpy(client_name, buf);
+
+    pthread_mutex_lock(&client_lock);
+    strncpy(c->name, client_name, sizeof(c->name) - 1);
+    c->name[sizeof(c->name) - 1] = '\0';
+    pthread_mutex_unlock(&client_lock);
+
+    // Notify others that a new client has joined
+    char join_msg[1100];
+    snprintf(join_msg, sizeof(join_msg), "%s has joined the chat.", c->name);
+    broadcast_server_message(join_msg);
 
     while (1) {
-        int bytes_read = read(clientfd, buf, sizeof(buf) - 1);
+        int bytes_read = read(c->sockfd, buf, sizeof(buf) - 1);
 
         // Connection closed by client
         if (bytes_read <= 0) {
@@ -75,33 +124,72 @@ void *handle_client_input(void *arg) {
         
         // Check the message for exit signal
         if (strncmp(buf, "/exit", 5) == 0) {
-            printf("Client %d sent EXIT signal. Closing connection...\n", clientfd);
-            close(clientfd);
+            printf("Client %d sent EXIT signal. Closing connection...\n", c->sockfd);
+
+            // Notify all clients that this client is leaving
+            char leave_msg[1100];
+            snprintf(leave_msg, sizeof(leave_msg), "%s has left the chat.", c->name);
+            broadcast_server_message(leave_msg);  // Broadcast that the client has left
+
+            close(c->sockfd);
 
             // Remove client from active clients list
             pthread_mutex_lock(&client_lock);
-            for (int i = 0; i < MAX_CLIENTS; i++) {
-                if (client_sockets[i] == clientfd) {
-                    client_sockets[i] = 0;
-                    break;
-                }
-            }
+            c->sockfd = 0;
+            memset(c->name, 0, sizeof(c->name));
             pthread_mutex_unlock(&client_lock);
+            
             pthread_exit(NULL);
         }
 
-        // If the message starts with "/say", broadcast it to all other clients
-        if (strncmp(buf, "/say ", 5) == 0) {
-            broadcast_client_message(buf + 5, clientfd);  // Skip "/say " and broadcast the message
+        // If the message starts with "/say @", find the target client and send the message
+        if (strncmp(buf, "/say @", 6) == 0) { // Skip "/say @"
+            char *original_msg = buf;  // Preserve the original buffer
+            char temp_buf[1000];       // Temporary buffer for processing
+            strncpy(temp_buf, buf, sizeof(temp_buf) - 1);
+            temp_buf[sizeof(temp_buf) - 1] = '\0';
+
+            char *client_name = temp_buf + 6; // Get the client name after "/say @"
+            char *message = strchr(client_name, ' '); // Find the space after the client name
+
+            if (message) {
+                *message = '\0';  // Null-terminate the client name
+                message++;  // Skip the space to get the message
+                int receiverfd = -1;
+
+                // Search for the target client in the client list
+                pthread_mutex_lock(&client_lock);
+                for (int i = 0; i < MAX_CLIENTS; i++) {
+                    if (clients[i].sockfd != 0 && strcmp(clients[i].name, client_name) == 0) {
+                        receiverfd = clients[i].sockfd;  // Found the client, get their sockfd
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&client_lock);
+
+                if (receiverfd != -1) {
+                    send_message_to_client(message, c, receiverfd);  // Send the message to the found client
+                } else {
+                    // If client is not found, inform the sender
+                    char not_found_msg[1100];
+                    snprintf(not_found_msg, sizeof(not_found_msg), "Client %s not found.\n", client_name);
+                    write(c->sockfd, not_found_msg, strlen(not_found_msg));
+                }
+            } else {
+                write(c->sockfd, "Invalid /say command format. Usage: /say @<clientname> <message>", 65);
+            }
+        } else {
+            // If the message is not a /say, broadcast it to all other clients
+            broadcast_client_message(buf, c);
         }
 
-		char client_message[1100];
-    	snprintf(client_message, sizeof(client_message), "Client %d: %s", clientfd, buf);
-		printf("%s\n", client_message);
+        char client_message[2100];
+        snprintf(client_message, sizeof(client_message), "%s: %s", c->name, buf);
+        printf("%s\n", client_message);
     }
 
-    printf("Client %d disconnected.\n", clientfd);
-    close(clientfd);
+    printf("%s disconnected.\n", client_name);
+    close(c->sockfd);
     pthread_exit(NULL);
 }
 
@@ -125,7 +213,7 @@ int main() {
     socklen_t sockaddr_size = sizeof(con_addr);
 
     pthread_mutex_init(&client_lock, NULL);
-    memset(client_sockets, 0, sizeof(client_sockets));
+    memset(clients, 0, sizeof(clients));
 
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
 
@@ -158,16 +246,18 @@ int main() {
 
  		// Add the client to the list
         pthread_mutex_lock(&client_lock);
+        client *c;
         for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (client_sockets[i] == 0) {
-                client_sockets[i] = clientfd;
+            if (clients[i].sockfd == 0) {
+                c = &clients[i];
+                c->sockfd = clientfd;
                 break;
             }
         }
         pthread_mutex_unlock(&client_lock);
 
         pthread_t client_thread;
-        pthread_create(&client_thread, NULL, handle_client_input, &clientfd);
+        pthread_create(&client_thread, NULL, handle_client_input, c);
         pthread_detach(client_thread); // Detach thread to prevent memory leaks
     }
 

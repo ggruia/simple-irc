@@ -61,7 +61,7 @@ int main()
             msg[strcspn(msg, "\n")] = 0;
 
             // Send the message to the server
-            int bytes_written = write(sockfd, msg, sizeof(msg) - 1);
+            int bytes_written = write(sockfd, msg, strlen(msg));
             if (bytes_written < 0) {
                 perror("write");
                 break;
